@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
@@ -9,7 +11,30 @@ html, body, #root { height: 100%; }
 body { font-family: var(--font-sans); }
 
 ::selection { background: #1e293b; color: #f8fafc; }
+.dark ::selection { background: #e2e8f0; color: #0f172a; }
 
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* Signature ambient glow behind the header, the one deliberate "big product" flourish */
+.ambient-glow {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 0;
+}
+.ambient-glow::before {
+  content: "";
+  position: absolute;
+  top: -120px;
+  left: 10%;
+  width: 420px;
+  height: 280px;
+  background: radial-gradient(ellipse at center, rgba(79,70,229,0.16), transparent 70%);
+  filter: blur(10px);
+}
+.dark .ambient-glow::before {
+  background: radial-gradient(ellipse at center, rgba(129,140,248,0.20), transparent 70%);
 }
