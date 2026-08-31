@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import RuleCard from './RuleCard.jsx';
+import RubricPresets from './RubricPresets.jsx';
 
 let ruleIdCounter = 0;
 const newRuleId = () => `rule_${Date.now()}_${ruleIdCounter++}`;
@@ -134,6 +135,8 @@ export default function RubricPanel({ columns, rules, setRules, threshold, setTh
           onChange={e => setThreshold(e.target.value)}
         />
       </div>
+
+      <RubricPresets rules={rules} threshold={threshold} setRules={setRules} setThreshold={setThreshold} />
     </div>
   );
 }

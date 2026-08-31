@@ -2,9 +2,14 @@ import { useEffect, useMemo, useState } from 'react';
 import DataInput from './components/DataInput.jsx';
 import RubricPanel from './components/RubricPanel.jsx';
 import ResultsTable from './components/ResultsTable.jsx';
+import ColumnMapping from './components/ColumnMapping.jsx';
 import Logo from './components/Logo.jsx';
 import { parseCSV, detectColumns, buildRecords } from './lib/csv.js';
 import { applyRules } from './lib/rules.js';
+
+// Stable reference for "no override applies": a fresh {} literal every
+// render would defeat the effectiveCols memoization below.
+const EMPTY_OVERRIDE = {};
 
 function useTheme() {
   const [theme, setTheme] = useState(() => {
@@ -28,20 +33,47 @@ export default function App() {
   const [rules, setRules] = useState([]);
   const [threshold, setThreshold] = useState(10);
 
-  const parsed = useMemo(() => {
-    if (!csvText.trim()) return { header: [], baseRecords: [] };
+  const rowsParsed = useMemo(() => {
+    if (!csvText.trim()) return { header: [], bodyRows: [] };
     const rows = parseCSV(csvText);
-    if (rows.length < 2) return { header: rows[0] || [], baseRecords: [] };
-    const header = rows[0];
-    const cols = detectColumns(header);
-    const baseRecords = buildRecords(rows.slice(1), header, cols);
-    return { header, baseRecords };
+    if (rows.length < 2) return { header: rows[0] || [], bodyRows: [] };
+    return { header: rows[0], bodyRows: rows.slice(1) };
   }, [csvText]);
 
-  const columns = parsed.header.map(h => h.trim()).filter(Boolean);
+  // A column-mapping override only makes sense for the header it was chosen
+  // against. Rather than resetting this state with an effect when a new CSV
+  // loads, it's tagged with the header it belongs to, and a stale override
+  // (from a previously loaded file) is simply ignored, purely derived during
+  // render, no effect or ref needed.
+  const [columnOverride, setColumnOverride] = useState({ headerKey: '', values: {} });
+  const headerKey = rowsParsed.header.join('');
+  const overrideValues = columnOverride.headerKey === headerKey ? columnOverride.values : EMPTY_OVERRIDE;
+
+  const detectedCols = useMemo(
+    () => (rowsParsed.header.length
+      ? detectColumns(rowsParsed.header)
+      : { company: -1, contact: -1, email: -1, domain: -1, size: -1 }),
+    [rowsParsed.header]
+  );
+
+  const effectiveCols = useMemo(
+    () => ({ ...detectedCols, ...overrideValues }),
+    [detectedCols, overrideValues]
+  );
+
+  const baseRecords = useMemo(
+    () => buildRecords(rowsParsed.bodyRows, rowsParsed.header, effectiveCols),
+    [rowsParsed, effectiveCols]
+  );
+
+  function handleColumnOverride(field, index) {
+    setColumnOverride({ headerKey, values: { ...overrideValues, [field]: index } });
+  }
+
+  const columns = rowsParsed.header.map(h => h.trim()).filter(Boolean);
   const records = useMemo(
-    () => applyRules(parsed.baseRecords, rules, threshold),
-    [parsed.baseRecords, rules, threshold]
+    () => applyRules(baseRecords, rules, threshold),
+    [baseRecords, rules, threshold]
   );
 
   return (
@@ -74,6 +106,16 @@ export default function App() {
       <div className="flex-1 flex overflow-hidden">
         <aside className="w-[380px] shrink-0 border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-y-auto p-5 space-y-6">
           <DataInput csvText={csvText} setCsvText={setCsvText} />
+          {rowsParsed.header.length > 0 && (
+            <div className="border-t border-slate-200 dark:border-slate-800 pt-5">
+              <ColumnMapping
+                header={rowsParsed.header}
+                detected={detectedCols}
+                override={overrideValues}
+                onChange={handleColumnOverride}
+              />
+            </div>
+          )}
           <div className="border-t border-slate-200 dark:border-slate-800 pt-5">
             <h2 className="text-sm font-semibold mb-3">Scoring rubric</h2>
             <RubricPanel
@@ -87,7 +129,7 @@ export default function App() {
         </aside>
 
         <main className="flex-1 min-w-0 p-5 flex flex-col overflow-hidden">
-          <ResultsTable records={records} />
+          <ResultsTable records={records} rules={rules} />
         </main>
       </div>
     </div>
