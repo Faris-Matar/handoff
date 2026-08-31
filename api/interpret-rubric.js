@@ -12,6 +12,10 @@
 // The only thing left to a model's judgement is *which* rules to write, the
 // shape of the output is guaranteed by the schema, not by hoping it followed
 // the prompt.
+//
+// Hardening: this endpoint is public and unauthenticated, so it also applies
+// a best-effort rate limit, a same-origin check, and input size caps. See the
+// comments on each below for exactly what they do and don't protect against.
 
 const OPERATOR_VALUES = [
   'contains', 'not_contains', 'equals', 'not_equals',
@@ -20,6 +24,57 @@ const OPERATOR_VALUES = [
 ];
 
 const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+const GEMINI_TIMEOUT_MS = 20_000;
+const MAX_RUBRIC_LENGTH = 2000;
+const MAX_COLUMNS = 50;
+
+// --- Rate limiting ---------------------------------------------------------
+// Best-effort, per-warm-instance only: this Map lives in the memory of a
+// single warm serverless instance. Vercel can (and under real load, will) run
+// several instances of this function concurrently, each with its own Map, so
+// a client spreading requests across instances is not actually capped at
+// 10/minute globally. This only stops a single client hammering a single warm
+// instance. A real production guarantee against sustained abuse needs a
+// shared store such as Vercel KV or Upstash Redis.
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 10;
+const rateLimitStore = new Map();
+
+function getClientId(req) {
+  const fwd = req.headers?.['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.trim()) return fwd.split(',')[0].trim();
+  return 'unknown';
+}
+
+function isRateLimited(clientId) {
+  const now = Date.now();
+  const recent = (rateLimitStore.get(clientId) || []).filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  recent.push(now);
+  rateLimitStore.set(clientId, recent);
+  return recent.length > RATE_LIMIT_MAX;
+}
+
+// --- Origin check ------------------------------------------------------
+// Rejects requests whose Origin/Referer host doesn't match this request's own
+// Host header. This stops casual cross-site abuse (some other page's script
+// fetching this endpoint from a visitor's browser). It does NOT stop a
+// determined attacker: a direct HTTP request can trivially spoof both
+// headers, and there is no real user authentication on this endpoint. If
+// neither header is present at all, the request is allowed through, since
+// some legitimate same-origin requests omit them.
+function hostFromHeaderValue(value) {
+  try { return new URL(value).host; } catch { return null; }
+}
+
+function isCrossOriginRequest(req) {
+  const origin = req.headers?.origin;
+  const referer = req.headers?.referer;
+  const host = req.headers?.host;
+  const source = origin || referer;
+  if (!source) return false;
+  const sourceHost = hostFromHeaderValue(source);
+  return sourceHost === null || sourceHost !== host;
+}
 
 function buildSchema(columns) {
   return {
@@ -58,6 +113,46 @@ function buildPrompt(rubricText, columns) {
   ].join('\n');
 }
 
+function geminiUrl() {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+}
+
+async function fetchGeminiOnce(rubricText, columns, apiKey) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  try {
+    const response = await fetch(geminiUrl(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: buildPrompt(rubricText, columns) }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: buildSchema(columns),
+        },
+      }),
+      signal: controller.signal,
+    });
+    return { ok: true, response };
+  } catch (err) {
+    return { ok: false, timedOut: err?.name === 'AbortError' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Retries exactly once on a timeout/network failure or a 5xx response.
+// Never retries a 4xx: a bad request will not succeed by repeating it.
+async function fetchGeminiWithRetry(rubricText, columns, apiKey) {
+  const first = await fetchGeminiOnce(rubricText, columns, apiKey);
+  const shouldRetry = !first.ok || (first.response.status >= 500 && first.response.status < 600);
+  if (!shouldRetry) return first;
+  return fetchGeminiOnce(rubricText, columns, apiKey);
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
@@ -70,30 +165,37 @@ export default async function handler(req, res) {
     return;
   }
 
+  if (isCrossOriginRequest(req)) {
+    res.status(403).json({ error: 'Cross-origin requests are not allowed' });
+    return;
+  }
+
+  if (isRateLimited(getClientId(req))) {
+    res.status(429).json({ error: 'Too many requests, please wait a minute and try again' });
+    return;
+  }
+
   const { rubricText, columns } = req.body || {};
   if (!rubricText || !Array.isArray(columns) || columns.length === 0) {
     res.status(400).json({ error: 'rubricText and a non-empty columns array are required' });
     return;
   }
+  if (rubricText.length > MAX_RUBRIC_LENGTH) {
+    res.status(400).json({ error: `rubricText must be ${MAX_RUBRIC_LENGTH} characters or fewer` });
+    return;
+  }
+  if (columns.length > MAX_COLUMNS) {
+    res.status(400).json({ error: `columns must contain ${MAX_COLUMNS} entries or fewer` });
+    return;
+  }
 
   try {
-    const upstream = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: buildPrompt(rubricText, columns) }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: buildSchema(columns),
-          },
-        }),
-      }
-    );
+    const attempt = await fetchGeminiWithRetry(rubricText, columns, apiKey);
+    if (!attempt.ok) {
+      res.status(504).json({ error: 'Gemini request timed out, please try again' });
+      return;
+    }
+    const upstream = attempt.response;
 
     if (!upstream.ok) {
       const errBody = await upstream.text().catch(() => '');
