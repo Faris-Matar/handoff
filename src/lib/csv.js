@@ -23,6 +23,8 @@ export function parseCSV(text) {
   return rows.filter(r => r.some(f => f.trim() !== ''));
 }
 
+// When two header names both match the same field (e.g. two columns named
+// "Email"), findIndex's left-to-right scan means the first match always wins.
 export function detectColumns(header) {
   const norm = header.map(h => (h || '').trim().toLowerCase());
   const find = (...keys) => {
@@ -116,15 +118,26 @@ export function buildRecords(bodyRows, header, cols) {
   });
 }
 
+// Guards against CSV/formula injection: a field value starting with =, +, -,
+// or @ can be interpreted as a formula by Excel/Sheets when the exported file
+// is reopened there. Lead data comes from an untrusted external source, so a
+// leading apostrophe forces spreadsheet apps to treat the value as literal
+// text. Values that don't start with one of those characters are untouched.
+function csvField(value) {
+  const str = String(value ?? '');
+  const guarded = /^[=+\-@]/.test(str) ? `'${str}` : str;
+  return `"${guarded.replace(/"/g, '""')}"`;
+}
+
 export function toCSV(records) {
-  const header = ['Company', 'Contact', 'Email', 'Domain', 'Employees', 'Fit Score', 'Qualified', 'Hygiene', 'Note'];
+  const header = ['Company', 'Contact', 'Email', 'Domain', 'Employees', 'Fit Score', 'Qualified', 'Hygiene', 'Note', 'Reasoning'];
   const lines = [header.join(',')];
   records.forEach(d => {
     const row = [
       d.company, d.contact, d.email, d.domain, d.size,
       d.score ?? '', d.qualified === undefined ? '' : (d.qualified ? 'Yes' : 'No'),
-      d.hygiene, d.hygieneNote,
-    ].map(v => `"${String(v ?? '').replace(/"/g, '""')}"`);
+      d.hygiene, d.hygieneNote, d.matchedRulesText ?? '',
+    ].map(csvField);
     lines.push(row.join(','));
   });
   return lines.join('\n');
