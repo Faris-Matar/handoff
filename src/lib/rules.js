@@ -79,6 +79,52 @@ export function evaluateRule(record, rule) {
   }
 }
 
+const DESCRIBE_LABEL = {
+  contains: 'contains',
+  not_contains: 'does not contain',
+  equals: 'equals',
+  not_equals: 'does not equal',
+  is_empty: 'is empty',
+  is_not_empty: 'is not empty',
+  in_list: 'is one of',
+  between: 'is between',
+  greater_than: 'is greater than',
+  less_than: 'is less than',
+};
+
+// Turns a rule into a plain-language sentence for the row-level score audit,
+// e.g. "Employees is between 50-500 → +20".
+export function describeRule(rule) {
+  const label = DESCRIBE_LABEL[rule.operator] || rule.operator;
+  const needsValue = !['is_empty', 'is_not_empty'].includes(rule.operator);
+  const weight = Number(rule.weight) || 0;
+  const weightText = weight >= 0 ? `+${weight}` : `${weight}`;
+  if (!needsValue) return `${rule.field} ${label} → ${weightText}`;
+  const value = rule.operator === 'in_list'
+    ? (rule.value || '').split(',').map(s => s.trim()).filter(Boolean).join(', ')
+    : rule.value;
+  return `${rule.field} ${label} ${value} → ${weightText}`;
+}
+
+// Maps matched rule ids (as returned by scoreRecord) back to full rule
+// definitions and describes each one, for the "why did this lead get this
+// score" audit trail.
+export function describeMatches(matchedIds, rules) {
+  const byId = new Map((rules || []).map(r => [r.id, r]));
+  return (matchedIds || []).map(id => byId.get(id)).filter(Boolean).map(describeRule);
+}
+
+// An empty/whitespace-only/non-numeric threshold means "unset", not zero:
+// Number('') is 0 in JavaScript, which would otherwise silently disqualify
+// every record. Zero itself is a legitimate threshold and must parse as 0.
+function parseThreshold(threshold) {
+  if (threshold === null || threshold === undefined) return null;
+  const str = String(threshold).trim();
+  if (str === '') return null;
+  const n = Number(str);
+  return Number.isNaN(n) ? null : n;
+}
+
 export function scoreRecord(record, rules) {
   let score = 0;
   const matched = [];
@@ -99,11 +145,13 @@ export function scoreRecord(record, rules) {
 
 export function applyRules(records, rules, threshold) {
   const activeRules = (rules || []).filter(r => r.field && r.operator);
+  const parsedThreshold = parseThreshold(threshold);
   return records.map(record => {
     if (activeRules.length === 0) {
       return { ...record, score: null, qualified: null };
     }
     const { score, matched } = scoreRecord(record, activeRules);
-    return { ...record, score, matchedRules: matched, qualified: score >= Number(threshold || 0) };
+    const qualified = parsedThreshold === null ? null : score >= parsedThreshold;
+    return { ...record, score, matchedRules: matched, qualified };
   });
 }
